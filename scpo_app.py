@@ -9,16 +9,20 @@ import json
 import os
 import sys
 import urllib.request
-import urllib.parse
-import http.cookiejar
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from io import BytesIO
+
+# ─── Selenium ────────────────────────────────────────────────────────────────
+from selenium import webdriver
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 
 # ─── Constantes fixas ────────────────────────────────────────────────────────
-URL_BASE      = "https://scpo.mte.gov.br"
-URL_LOGIN     = "https://scpo.mte.gov.br/Default.aspx"
-URL_COMUNICAR = "https://scpo.mte.gov.br/DeclaracaoPreviaObra/Comunicar.aspx"
+URL_SCPO      = "https://scpo.mte.gov.br/"
 LOGIN_CPF     = "038.144.411-25"
 EMAIL_FIXO    = "joaovitorcabral94@gmail.com"
 TELEFONE_FIXO = "6299266-5923"
@@ -91,315 +95,341 @@ def gerar_observacao(rua: str, quadra: str, lote: str,
 def data_termino_auto() -> str:
     return (datetime.today() + relativedelta(months=1)).strftime("%d/%m/%Y")
 
-# ─── Parser HTML mínimo (extrai campos ASP.NET sem BeautifulSoup) ─────────────
-def _extrair_campo(html: str, name: str) -> str:
-    """Extrai value de <input name='X' value='Y'>"""
-    import re
-    padrao = rf'<input[^>]+name="{re.escape(name)}"[^>]+value="([^"]*)"'
-    m = re.search(padrao, html, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    # tenta ordem invertida (value antes de name)
-    padrao2 = rf'<input[^>]+value="([^"]*)"[^>]+name="{re.escape(name)}"'
-    m2 = re.search(padrao2, html, re.IGNORECASE)
-    return m2.group(1) if m2 else ""
-
-def _extrair_campos_asp(html: str) -> dict:
-    """Extrai __VIEWSTATE, __EVENTVALIDATION e outros campos ocultos ASP.NET."""
-    campos = {}
-    for campo in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION",
-                  "__EVENTTARGET", "__EVENTARGUMENT"]:
-        campos[campo] = _extrair_campo(html, campo)
-    return campos
-
-# ─── Sessão HTTP (substitui Selenium por completo) ───────────────────────────
-class SessaoSCPO:
+# ─── Detecta caminho do EdgeDriver instalado no Windows ──────────────────────
+def _encontrar_msedgedriver() -> str:
     """
-    Gerencia a sessão HTTP com o SCPO usando apenas urllib da stdlib.
-    Sem Selenium, sem ChromeDriver, sem navegador.
+    O EdgeDriver (msedgedriver.exe) vem junto com o Edge no Windows.
+    Localiza automaticamente sem precisar baixar nada.
     """
-    HEADERS = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    }
+    import subprocess, re as _re
 
-    def __init__(self):
-        self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar),
-            urllib.request.HTTPSHandler(),
-        )
-        self.opener.addheaders = list(self.HEADERS.items())
+    # Caminhos padrão onde o msedgedriver pode estar
+    caminhos_fixos = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedgedriver.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedgedriver.exe",
+    ]
+    for p in caminhos_fixos:
+        if os.path.exists(p):
+            return p
 
-    def get(self, url: str) -> str:
-        """GET — retorna HTML decodificado."""
-        req = urllib.request.Request(url, headers=self.HEADERS)
-        with self.opener.open(req, timeout=20) as r:
-            raw = r.read()
-        # descomprime gzip se necessário
-        encoding = ""
-        for h in ["Content-Encoding"]:
-            try: encoding = r.headers.get(h, "")
-            except Exception: pass
-        if encoding == "gzip":
-            import gzip
-            raw = gzip.decompress(raw)
-        return raw.decode("utf-8", errors="replace")
-
-    def post(self, url: str, campos: dict, referer: str = "") -> str:
-        """POST com campos urlencoded — retorna HTML decodificado."""
-        dados = urllib.parse.urlencode(campos).encode("utf-8")
-        headers = dict(self.HEADERS)
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        headers["Referer"] = referer or url
-        req = urllib.request.Request(url, data=dados, headers=headers, method="POST")
-        with self.opener.open(req, timeout=30) as r:
-            raw = r.read()
-        encoding = ""
-        try: encoding = r.headers.get("Content-Encoding", "")
-        except Exception: pass
-        if encoding == "gzip":
-            import gzip
-            raw = gzip.decompress(raw)
-        return raw.decode("utf-8", errors="replace")
-
-    def get_imagem_captcha(self, url_img: str) -> bytes:
-        """Baixa imagem do captcha como bytes."""
-        req = urllib.request.Request(url_img, headers=self.HEADERS)
-        with self.opener.open(req, timeout=10) as r:
-            return r.read()
-
-
-# ─── Automação principal (sem navegador) ─────────────────────────────────────
-def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
-    import traceback, re
-    sessao = SessaoSCPO()
+    # Tenta localizar via where
     try:
-        # ── 1. Carregar página de login ───────────────────────────────────────
-        log_cb("Abrindo pagina de login do SCPO...")
-        step_cb(5, "Carregando pagina de login")
-        html_login = sessao.get(URL_LOGIN)
-        asp = _extrair_campos_asp(html_login)
+        resultado = subprocess.check_output(
+            ["where", "msedgedriver"], stderr=subprocess.DEVNULL, timeout=5
+        ).decode().strip().splitlines()
+        if resultado:
+            return resultado[0]
+    except Exception:
+        pass
 
-        # ── 2. Extrair e exibir imagem do captcha ─────────────────────────────
-        log_cb("Extraindo captcha...")
-        step_cb(10, "Aguardando captcha")
+    # Busca na pasta de instalação do Edge pelo número de versão
+    base = r"C:\Program Files (x86)\Microsoft\Edge\Application"
+    if os.path.isdir(base):
+        for entry in os.listdir(base):
+            driver = os.path.join(base, entry, "msedgedriver.exe")
+            if os.path.exists(driver):
+                return driver
 
-        img_bytes = b""
-        # Log dos primeiros 500 chars do HTML para diagnóstico
-        log_cb(f"HTML recebido ({len(html_login)} chars): {html_login[:300].replace(chr(10),' ')}")
+    return ""  # não encontrado — usa Selenium Manager como fallback
 
-        m = re.search(r'src="(CaptchaImage\.axd\?[^"]+)"', html_login, re.IGNORECASE)
-        if not m:
-            # Tenta padrão alternativo
-            m = re.search(r"src='(CaptchaImage\.axd\?[^']+)'", html_login, re.IGNORECASE)
-        if not m:
-            # Tenta qualquer referência ao captcha
-            m = re.search("(CaptchaImage[^ \"]+)", html_login, re.IGNORECASE)
 
-        if m:
-            raw_url = m.group(1)
-            url_captcha = (URL_BASE + "/" + raw_url) if not raw_url.startswith("http") else raw_url
-            log_cb(f"Captcha URL: {url_captcha}")
-            try:
-                img_bytes = sessao.get_imagem_captcha(url_captcha)
-                log_cb(f"Imagem captcha: {len(img_bytes)} bytes")
-            except Exception as ex:
-                log_cb(f"Erro ao baixar captcha: {ex}")
+# ─── Automação Selenium com Edge ─────────────────────────────────────────────
+def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
+    import time, traceback
+    driver = None
+    try:
+        # ── 1. Iniciar Edge ───────────────────────────────────────────────────
+        log_cb("Iniciando Microsoft Edge...")
+        step_cb(5, "Abrindo Edge")
+
+        options = EdgeOptions()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-notifications")
+        options.add_experimental_option("prefs", {
+            "download.default_directory": dados["pasta_download"],
+            "download.prompt_for_download": False,
+            "plugins.always_open_pdf_externally": True,
+        })
+
+        driver_path = _encontrar_msedgedriver()
+        if driver_path:
+            log_cb(f"EdgeDriver encontrado: {driver_path}")
+            driver = webdriver.Edge(
+                service=EdgeService(driver_path), options=options)
         else:
-            log_cb("⚠ Captcha nao encontrado. HTML dump salvo no relatorio.")
-            # Salva HTML completo para análise
-            try:
-                log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SCPOApp")
-                os.makedirs(log_dir, exist_ok=True)
-                html_path = os.path.join(log_dir, "html_login_debug.html")
-                with open(html_path, "w", encoding="utf-8") as hf:
-                    hf.write(html_login)
-                log_cb(f"HTML salvo em: {html_path}")
-                log_cb("Abra esse arquivo no navegador para ver o que o site retornou.")
-            except Exception:
-                pass
+            # Selenium Manager detecta automaticamente
+            log_cb("EdgeDriver nao encontrado localmente — usando Selenium Manager...")
+            driver = webdriver.Edge(options=options)
 
-        # Dispara popup via callback para a UI (thread-safe)
-        dados["captcha_img_bytes"] = img_bytes
-        dados["fn_mostrar_captcha"](img_bytes)  # chama diretamente a UI
+        wait = WebDriverWait(driver, 20)
 
-        log_cb(">>> Janela do captcha aberta no app — digite e clique Confirmar")
-        dados["evento_captcha"].wait()  # aguarda usuário digitar
-        captcha_digitado = dados.get("captcha_valor", "")
-        log_cb(f"Captcha recebido: {captcha_digitado}")
+        # ── 2. Login ──────────────────────────────────────────────────────────
+        log_cb(f"Abrindo {URL_SCPO}...")
+        step_cb(10, "Abrindo SCPO")
+        driver.get(URL_SCPO)
 
-        # ── 3. POST de login ──────────────────────────────────────────────────
+        # IDs confirmados via DevTools
+        wait.until(EC.presence_of_element_located(
+            (By.ID, "PlaceHolderConteudo_txtCPF"))).send_keys(LOGIN_CPF)
+        driver.find_element(
+            By.ID, "PlaceHolderConteudo_txtSenha").send_keys(senha)
+
+        log_cb("Login e senha preenchidos.")
+        log_cb(">>> Digite o codigo de seguranca no navegador e clique 'Codigo digitado'")
+        step_cb(15, "Aguardando codigo de seguranca")
+
+        # Habilita botão de captcha na UI
+        dados["fn_habilitar_captcha"]()
+        dados["evento_captcha"].wait()
+
+        log_cb("Codigo confirmado. Clicando em Entrar...")
         step_cb(20, "Efetuando login")
-        log_cb("Enviando login...")
+        driver.find_element(By.ID, "PlaceHolderConteudo_btnLogin").click()
+        time.sleep(2)
 
-        campos_login = {
-            "__VIEWSTATE":          asp.get("__VIEWSTATE", ""),
-            "__VIEWSTATEGENERATOR": asp.get("__VIEWSTATEGENERATOR", ""),
-            "__EVENTVALIDATION":    asp.get("__EVENTVALIDATION", ""),
-            "__EVENTTARGET":        "",
-            "__EVENTARGUMENT":      "",
-            "ct100$PlaceHolderConteudo$txtCPF":     LOGIN_CPF,
-            "ct100$PlaceHolderConteudo$txtSenha":   senha,
-            "ct100$PlaceHolderConteudo$txtCaptcha": captcha_digitado,
-            "ct100$PlaceHolderConteudo$btnLogin":   "Entrar",
-        }
-        html_pos_login = sessao.post(URL_LOGIN, campos_login, referer=URL_LOGIN)
-
-        # Verifica se login falhou
-        if "txtCPF" in html_pos_login or "Entrar" in html_pos_login[:2000]:
-            # Ainda na página de login — captcha ou senha errados
-            if "captcha" in html_pos_login.lower() or "codigo" in html_pos_login.lower():
-                raise Exception("Captcha incorreto. Tente novamente.")
-            if "senha" in html_pos_login.lower() and "incorret" in html_pos_login.lower():
-                raise Exception("Senha incorreta.")
-            raise Exception("Login falhou. Verifique CPF, senha e captcha.")
-
-        # Verifica pedido de troca de senha
-        if "RedefinirSenha" in html_pos_login or "alterar" in html_pos_login.lower():
-            log_cb("⚠ Site solicita alteracao de senha.")
-            log_cb("Altere a senha no navegador e clique 'Senha alterada — Continuar'.")
+        # Verifica troca de senha
+        if "RedefinirSenha" in driver.current_url or (
+                "alterar" in driver.page_source.lower() and
+                "senha" in driver.page_source.lower()):
+            log_cb("Site solicita alteracao de senha.")
+            log_cb("Altere no navegador e clique 'Senha alterada'.")
+            step_cb(22, "Aguardando alteracao de senha")
+            dados["fn_habilitar_senha"]()
             dados["evento_senha"].wait()
-            nova_senha = dados.get("nova_senha", senha)
-            salvar_config({"senha": nova_senha})
-            senha = nova_senha
-            log_cb("Nova senha salva. Prosseguindo...")
-            html_pos_login = sessao.get(URL_LOGIN)
+            salvar_config({"senha": dados.get("nova_senha", senha)})
+            log_cb("Nova senha salva.")
 
-        log_cb("Login realizado com sucesso!")
+        log_cb("Login OK!")
 
-        # ── 4. Navegar para Comunicar Obra ────────────────────────────────────
-        step_cb(30, "Abrindo pagina Comunicar Obra")
-        log_cb("Navegando para Comunicar Obra...")
-        html_comunicar = sessao.get(URL_COMUNICAR)
-        asp2 = _extrair_campos_asp(html_comunicar)
+        # ── 3. Navegação para Comunicar Obra ──────────────────────────────────
+        step_cb(30, "Navegando para Comunicar Obra")
+        log_cb("Abrindo menu Comunicacao...")
+        wait.until(EC.element_to_be_clickable(
+            (By.XPATH, "//a[contains(@onclick,'subMenu01')]"))).click()
+        time.sleep(1)
+        wait.until(EC.element_to_be_clickable(
+            (By.XPATH, "//a[contains(@href,'DeclaracaoPreviaObra/Comunicar')]"))).click()
 
-        # ── 5. POST — marcar sem CNPJ e preencher CPF ─────────────────────────
-        step_cb(40, "Identificando empresa")
-        log_cb("Marcando 'Obra nao tem CNPJ' e informando CPF...")
+        # ── 4. Tela intermediária ─────────────────────────────────────────────
+        step_cb(35, "Identificando empresa")
+        log_cb("Marcando 'Obra nao tem CNPJ'...")
+        chk = wait.until(EC.presence_of_element_located(
+            (By.ID, "PlaceHolderConteudo_chkObraSemCNPJ")))
+        if not chk.is_selected():
+            chk.click()
+        time.sleep(1)
 
-        # Simula clique no checkbox (postback ASP.NET)
-        campos_empresa = {
-            "__VIEWSTATE":          asp2.get("__VIEWSTATE", ""),
-            "__VIEWSTATEGENERATOR": asp2.get("__VIEWSTATEGENERATOR", ""),
-            "__EVENTVALIDATION":    asp2.get("__EVENTVALIDATION", ""),
-            "__EVENTTARGET":        "ct100$PlaceHolderConteudo$chkObraSemCNPJ",
-            "__EVENTARGUMENT":      "",
-            "ct100$PlaceHolderConteudo$chkObraSemCNPJ": "on",
-            "ct100$PlaceHolderConteudo$txtCPFProprietarioObra": LOGIN_CPF,
-        }
-        html_apos_checkbox = sessao.post(URL_COMUNICAR, campos_empresa, referer=URL_COMUNICAR)
-        asp3 = _extrair_campos_asp(html_apos_checkbox)
+        cpf_field = wait.until(EC.element_to_be_clickable(
+            (By.ID, "txtCPFProprietarioObra")))
+        cpf_field.clear()
+        cpf_field.send_keys(LOGIN_CPF)
 
-        # ── 6. POST — clicar "Comunicar Obra" (abre formulário) ───────────────
-        step_cb(45, "Abrindo formulario principal")
-        log_cb("Clicando em Comunicar Obra...")
+        wait.until(EC.element_to_be_clickable(
+            (By.ID, "PlaceHolderConteudo_btnDeclararObra"))).click()
 
-        campos_declarar = {
-            "__VIEWSTATE":          asp3.get("__VIEWSTATE", ""),
-            "__VIEWSTATEGENERATOR": asp3.get("__VIEWSTATEGENERATOR", ""),
-            "__EVENTVALIDATION":    asp3.get("__EVENTVALIDATION", ""),
-            "__EVENTTARGET":        "",
-            "__EVENTARGUMENT":      "",
-            "ct100$PlaceHolderConteudo$chkObraSemCNPJ": "on",
-            "ct100$PlaceHolderConteudo$txtCPFProprietarioObra": LOGIN_CPF,
-            "ct100$PlaceHolderConteudo$btnDeclararObra": "Comunicar Obra",
-        }
-        html_form = sessao.post(URL_COMUNICAR, campos_declarar, referer=URL_COMUNICAR)
-        asp4 = _extrair_campos_asp(html_form)
-
-        # ── 7. POST — formulário principal ────────────────────────────────────
-        step_cb(60, "Preenchendo formulario")
+        # ── 5. Formulário principal ───────────────────────────────────────────
+        step_cb(45, "Preenchendo formulario")
         log_cb("Preenchendo dados da obra...")
+
+        # Nome da obra
+        f = wait.until(EC.presence_of_element_located(
+            (By.XPATH, "//input[contains(@id,'NomeObra') or contains(@id,'nomeObra') or contains(@name,'NomeObra')]")))
+        f.clear(); f.send_keys(dados["nome_obra"])
         log_cb(f"  Nome: {dados['nome_obra']}")
-        log_cb(f"  Obs: {dados['observacao'][:80]}...")
 
-        # Converte data DD/MM/YYYY para o formato esperado pelo site
-        dt_ini = dados["data_inicio"]   # DD/MM/YYYY
-        dt_fim = dados["data_termino"]  # DD/MM/YYYY
+        # Email
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'Email') or contains(@id,'email')]")
+            f.clear(); f.send_keys(EMAIL_FIXO)
+        except Exception:
+            log_cb("  campo email nao localizado")
 
-        campos_form = {
-            "__VIEWSTATE":          asp4.get("__VIEWSTATE", ""),
-            "__VIEWSTATEGENERATOR": asp4.get("__VIEWSTATEGENERATOR", ""),
-            "__EVENTVALIDATION":    asp4.get("__EVENTVALIDATION", ""),
-            "__EVENTTARGET":        "",
-            "__EVENTARGUMENT":      "",
-            # Dados da obra
-            "ct100$PlaceHolderConteudo$txtNomeObra":         dados["nome_obra"],
-            "ct100$PlaceHolderConteudo$chkContratantePrincipal": "on",  # Sim
-            "ct100$PlaceHolderConteudo$txtEmailObra":        EMAIL_FIXO,
-            "ct100$PlaceHolderConteudo$txtTelefoneObra":     TELEFONE_FIXO,
-            # Endereço
-            "ct100$PlaceHolderConteudo$txtCEPObra":          dados["cep"],
-            "ct100$PlaceHolderConteudo$txtComplementoObra":  f"QUADRA {dados['quadra']} LOTE {dados['lote']}",
-            # Detalhamento
-            "ct100$PlaceHolderConteudo$ddlClasseCNAE":       "4120-4",
-            "ct100$PlaceHolderConteudo$ddlSubclasse":        "00",
-            "ct100$PlaceHolderConteudo$ddlTipoConstrucao":   "1",   # Edifício
-            "ct100$PlaceHolderConteudo$rdTipoObra":          "2",   # Privada
-            "ct100$PlaceHolderConteudo$rdCaracteristicaObra":"1",   # Construção
-            "ct100$PlaceHolderConteudo$txtDescricaoObra":    dados["observacao"],
-            # FGTS — Não
-            "ct100$PlaceHolderConteudo$rdObraFGTS":          "2",
-            # Datas
-            "ct100$PlaceHolderConteudo$txtDataInicioObra":   dt_ini,
-            "ct100$PlaceHolderConteudo$txtDataTerminoObra":  dt_fim,
-            # Empregados
-            "ct100$PlaceHolderConteudo$txtNumEmpregadosPrincipal": EMP_PRINCIPAL,
-            "ct100$PlaceHolderConteudo$txtNumEmpregadosTerceiros": EMP_TERCEIROS,
-            # Botão submit
-            "ct100$PlaceHolderConteudo$btnDeclararObra2":    "Comunicar Obra",
-        }
+        # Telefone
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'Telefone') or contains(@id,'telefone')]")
+            f.clear(); f.send_keys(TELEFONE_FIXO)
+        except Exception:
+            log_cb("  campo telefone nao localizado")
 
-        # Segunda rua (esquina)
+        # CEP + lupa
+        log_cb("  Preenchendo CEP...")
+        f = driver.find_element(By.XPATH,
+            "//input[contains(@id,'CEP') or contains(@id,'Cep') or contains(@id,'cep')]")
+        f.clear(); f.send_keys(dados["cep"])
+        try:
+            lupa = driver.find_element(By.XPATH,
+                "//img[contains(@src,'lupa') or contains(@title,'Pesquisar CEP')] | "
+                "//a[contains(@onclick,'CEP') or contains(@onclick,'Cep')]")
+            lupa.click()
+            time.sleep(3)
+        except Exception:
+            log_cb("  lupa CEP nao localizada — preenchimento manual pode ser necessario")
+
+        # Complemento
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'Complemento') or contains(@id,'complemento')]")
+            f.clear(); f.send_keys(f"QUADRA {dados['quadra']} LOTE {dados['lote']}")
+        except Exception:
+            log_cb("  campo complemento nao localizado")
+
+        # 2ª rua (esquina)
         if dados.get("esquina") and dados.get("rua2"):
-            campos_form["ct100$PlaceHolderConteudo$txtLogradouro2Obra"] = dados["rua2"]
+            log_cb("  Lote de esquina — preenchendo 2a rua...")
+            try:
+                f = driver.find_element(By.XPATH,
+                    "//input[contains(@id,'Logradouro2') or contains(@id,'logradouro2')]")
+                f.clear(); f.send_keys(dados["rua2"])
+            except Exception:
+                log_cb("  campo logradouro2 nao localizado")
 
-        step_cb(80, "Submetendo formulario")
-        log_cb("Submetendo...")
-        html_resultado = sessao.post(URL_COMUNICAR, campos_form, referer=URL_COMUNICAR)
+        # Classe CNAE 4120-4
+        step_cb(60, "Selecionando classe e tipo")
+        try:
+            sel = Select(wait.until(EC.presence_of_element_located(
+                (By.XPATH, "//select[contains(@id,'Classe') or contains(@id,'classe') or contains(@id,'CNAE')]"))))
+            for o in sel.options:
+                if "4120" in o.text:
+                    sel.select_by_visible_text(o.text); break
+        except Exception:
+            log_cb("  select classe nao localizado")
 
-        # ── 8. Verificar resultado ────────────────────────────────────────────
-        if "erro" in html_resultado.lower() and "obrigat" in html_resultado.lower():
-            raise Exception("Formulario retornou erro de validacao. "
-                            "Verifique os dados e tente novamente.")
+        # Subclasse 00
+        time.sleep(1)
+        try:
+            sel = Select(wait.until(EC.presence_of_element_located(
+                (By.XPATH, "//select[contains(@id,'Subclasse') or contains(@id,'subclasse')]"))))
+            for o in sel.options:
+                if o.text.strip().startswith("00"):
+                    sel.select_by_visible_text(o.text); break
+        except Exception:
+            log_cb("  select subclasse nao localizado")
 
-        # Procura numero de protocolo/recibo na pagina de confirmacao
-        m_prot = re.search(r'(\d{6,})', html_resultado)
-        protocolo = m_prot.group(1) if m_prot else "N/D"
-        log_cb(f"✔ Obra comunicada! Protocolo: {protocolo}")
+        # Tipo de construção
+        try:
+            sel = Select(driver.find_element(By.XPATH,
+                "//select[contains(@id,'TipoConstrucao') or contains(@id,'tipoConstrucao')]"))
+            for o in sel.options:
+                if "dif" in o.text.lower():
+                    sel.select_by_visible_text(o.text); break
+        except Exception:
+            log_cb("  select tipo construcao nao localizado")
 
+        # Tipo obra — Privada
+        try:
+            driver.find_element(By.XPATH,
+                "//input[@type='radio' and "
+                "(@value='Privada' or @value='privada' or contains(@id,'rivada'))]").click()
+        except Exception:
+            log_cb("  radio privada nao localizado")
+
+        # Característica — Construção
+        try:
+            driver.find_element(By.XPATH,
+                "//input[@type='radio' and "
+                "(@value='Construcao' or @value='Construção' or contains(@id,'onstrucao'))]").click()
+        except Exception:
+            log_cb("  radio construcao nao localizado")
+
+        # Observação
+        step_cb(70, "Observacao e datas")
+        try:
+            f = driver.find_element(By.XPATH,
+                "//textarea[contains(@id,'Observ') or contains(@id,'observ') "
+                "or contains(@id,'Descri') or contains(@id,'descri')]")
+            f.clear(); f.send_keys(dados["observacao"])
+            log_cb("  Observacao preenchida.")
+        except Exception:
+            log_cb("  textarea observacao nao localizada")
+
+        # FGTS — Não
+        try:
+            driver.find_element(By.XPATH,
+                "//input[@type='radio' and "
+                "(contains(@id,'FGTSNao') or contains(@id,'fgtsNao') or "
+                "(@name and contains(@name,'FGTS') and @value='N') or "
+                "(@name and contains(@name,'FGTS') and @value='2'))]").click()
+        except Exception:
+            log_cb("  radio FGTS nao localizado")
+
+        # Datas
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'DataInicio') or contains(@id,'dataInicio')]")
+            f.clear(); f.send_keys(dados["data_inicio"])
+        except Exception:
+            log_cb("  campo data inicio nao localizado")
+
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'DataTermino') or contains(@id,'dataTermino')]")
+            f.clear(); f.send_keys(dados["data_termino"])
+        except Exception:
+            log_cb("  campo data termino nao localizado")
+
+        log_cb(f"  Inicio: {dados['data_inicio']} | Termino: {dados['data_termino']}")
+
+        # Empregados
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'EmpPrincipal') or contains(@id,'empPrincipal') "
+                "or contains(@id,'NumEmpregadosPrincipal')]")
+            f.clear(); f.send_keys(EMP_PRINCIPAL)
+        except Exception:
+            log_cb("  campo emp principal nao localizado")
+
+        try:
+            f = driver.find_element(By.XPATH,
+                "//input[contains(@id,'EmpTerceiros') or contains(@id,'empTerceiros') "
+                "or contains(@id,'NumEmpregadosTerceiros')]")
+            f.clear(); f.send_keys(EMP_TERCEIROS)
+        except Exception:
+            log_cb("  campo emp terceiros nao localizado")
+
+        # ── 6. Submeter ───────────────────────────────────────────────────────
+        step_cb(85, "Submetendo")
+        log_cb("Clicando em Comunicar Obra...")
+        try:
+            driver.find_element(By.XPATH,
+                "//input[@type='submit' and (contains(@value,'Comunicar') or contains(@value,'comunicar'))] | "
+                "//button[contains(text(),'Comunicar')]").click()
+        except Exception:
+            log_cb("  botao submit nao localizado — tentando via JavaScript...")
+            driver.execute_script(
+                "document.querySelector('input[type=submit]').click()")
+
+        time.sleep(3)
         step_cb(100, "Concluido!")
-        done_cb(True, f"SCPO preenchido com sucesso!\nProtocolo: {protocolo}")
+        log_cb("Formulario submetido! Verifique o navegador para confirmar.")
+        done_cb(True, "SCPO preenchido!\nVerifique o navegador Edge para confirmar o protocolo.")
 
     except Exception as e:
         tb = traceback.format_exc()
-        log_cb(f"✖ ERRO: {e}")
+        log_cb(f"ERRO: {e}")
         for linha in tb.splitlines():
             log_cb(linha)
         try:
             log_dir = os.path.join(
                 os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SCPOApp")
             os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, f"erro_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+            log_path = os.path.join(
+                log_dir, f"erro_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
             with open(log_path, "w", encoding="utf-8") as lf:
                 lf.write(f"Erro: {e}\n\n{tb}")
-            log_cb(f"Relatorio salvo em: {log_path}")
+            log_cb(f"Relatorio: {log_path}")
         except Exception:
             pass
         done_cb(False, str(e))
+    # Edge permanece aberto para conferência
 
 
 # ─── Interface Tkinter ────────────────────────────────────────────────────────
 class AppSCPO(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SCPO Automation — Berçan Projetos")
+        self.title("SCPO Automation — Bercan Projetos")
         self.configure(bg=COR_BG)
         self.resizable(False, False)
         self.config_dados    = carregar_config()
@@ -408,55 +438,9 @@ class AppSCPO(tk.Tk):
         self.var_senha       = tk.StringVar(value=self.config_dados.get("senha", "SCPO123"))
         self._evento_captcha = threading.Event()
         self._evento_senha   = threading.Event()
-        self._nova_senha_tmp       = ""
+        self._nova_senha_tmp = ""
         self._build_ui()
 
-    def _mostrar_janela_captcha(self, img_bytes: bytes):
-        """Abre popup com imagem do captcha e campo para digitar."""
-        try:
-            from PIL import Image, ImageTk
-            img = Image.open(BytesIO(img_bytes))
-            # Aumenta para facilitar leitura
-            img = img.resize((img.width * 3, img.height * 3), Image.NEAREST)
-            photo = ImageTk.PhotoImage(img)
-
-            win = tk.Toplevel(self)
-            win.title("Codigo de Segurança")
-            win.configure(bg=COR_BG)
-            win.grab_set()
-            win.resizable(False, False)
-
-            tk.Label(win, text="Digite o codigo abaixo:", bg=COR_BG,
-                     fg=COR_LABEL, font=("Consolas", 10)).pack(pady=(12, 4))
-            lbl_img = tk.Label(win, image=photo, bg=COR_BG)
-            lbl_img.image = photo  # mantém referência
-            lbl_img.pack(padx=16, pady=4)
-
-            var_cap = tk.StringVar()
-            ent = tk.Entry(win, textvariable=var_cap, bg=COR_CAMPO, fg=COR_TEXTO,
-                           font=("Consolas", 14, "bold"), justify="center",
-                           insertbackground=COR_TEXTO, relief="flat", width=12)
-            ent.pack(pady=8)
-            ent.focus()
-
-            def confirmar():
-                self._dados_run["captcha_valor"] = var_cap.get().strip()
-                self._evento_captcha.set()
-                win.destroy()
-
-            tk.Button(win, text="Confirmar", bg=COR_BOTAO, fg=COR_TEXTO,
-                      font=("Consolas", 11, "bold"), relief="flat",
-                      cursor="hand2", command=confirmar).pack(pady=(0, 12))
-            ent.bind("<Return>", lambda e: confirmar())
-
-        except ImportError:
-            # Pillow indisponível — fallback: simpledialog
-            val = simpledialog.askstring("Codigo de Segurança",
-                                          "Digite o codigo de segurança:", parent=self)
-            self._dados_run["captcha_valor"] = val or ""
-            self._evento_captcha.set()
-
-    # ── Construção da UI ──────────────────────────────────────────────────────
     def _build_ui(self):
         PAD = 12
         tk.Label(self, text="SCPO AUTOMATION", bg=COR_BG, fg=COR_TEXTO,
@@ -479,7 +463,6 @@ class AppSCPO(tk.Tk):
             e.grid(row=row, column=1, sticky="w", pady=3)
             return e
 
-        # CEP
         lbl(0, "CEP:")
         frame_cep = tk.Frame(frame, bg=COR_BG)
         frame_cep.grid(row=0, column=1, sticky="w")
@@ -490,17 +473,15 @@ class AppSCPO(tk.Tk):
         tk.Button(frame_cep, text="Buscar", bg=COR_CAMPO, fg=COR_LOG_TEXT,
                   font=("Consolas", 8), relief="flat", cursor="hand2",
                   command=self._buscar_cep).pack(side="left", padx=6)
-        self._lbl_cep_status = tk.Label(frame_cep, text="", bg=COR_BG,
-                                         fg=COR_LOG_TEXT, font=("Consolas", 8))
-        self._lbl_cep_status.pack(side="left")
+        self._lbl_cep = tk.Label(frame_cep, text="", bg=COR_BG,
+                                  fg=COR_LOG_TEXT, font=("Consolas", 8))
+        self._lbl_cep.pack(side="left")
 
-        lbl(1, "Rua Principal:")
-        self.ent_rua = ent(1)
-
-        lbl(2, "Quadra:");    self.ent_quadra    = ent(2, width=10)
-        lbl(3, "Lote:");      self.ent_lote      = ent(3, width=10)
-        lbl(4, "Nr Casas:");  self.ent_num_casas = ent(4, width=5)
-        self.ent_num_casas.bind("<FocusOut>", self._atualizar_casas_esquina)
+        lbl(1, "Rua Principal:"); self.ent_rua    = ent(1)
+        lbl(2, "Quadra:");        self.ent_quadra = ent(2, width=10)
+        lbl(3, "Lote:");          self.ent_lote   = ent(3, width=10)
+        lbl(4, "Nr Casas:");      self.ent_ncasas = ent(4, width=5)
+        self.ent_ncasas.bind("<FocusOut>", self._atualizar_casas)
 
         tk.Checkbutton(frame, text="Lote de esquina (frente para 2 ruas)",
                        variable=self.var_esquina, command=self._toggle_esquina,
@@ -519,11 +500,11 @@ class AppSCPO(tk.Tk):
         self._entries_rua_casa = []
 
         lbl(8, "Data de Inicio:")
-        self.ent_data_ini = tk.Entry(frame, textvariable=self.var_data_ini,
-                                      bg=COR_CAMPO, fg=COR_TEXTO,
-                                      insertbackground=COR_TEXTO, font=("Consolas", 10),
-                                      relief="flat", width=12)
-        self.ent_data_ini.grid(row=8, column=1, sticky="w", pady=3)
+        self.ent_data = tk.Entry(frame, textvariable=self.var_data_ini,
+                                  bg=COR_CAMPO, fg=COR_TEXTO,
+                                  insertbackground=COR_TEXTO, font=("Consolas", 10),
+                                  relief="flat", width=12)
+        self.ent_data.grid(row=8, column=1, sticky="w", pady=3)
         tk.Label(frame, text="(DD/MM/YYYY)", bg=COR_BG, fg=COR_LABEL,
                  font=("Consolas", 8)).grid(row=8, column=1, sticky="e")
 
@@ -545,18 +526,18 @@ class AppSCPO(tk.Tk):
                  ).grid(row=11, column=0, columnspan=2, sticky="ew", pady=8)
 
         lbl(12, "Senha SCPO:")
-        frame_senha = tk.Frame(frame, bg=COR_BG)
-        frame_senha.grid(row=12, column=1, sticky="w")
-        self.ent_senha = tk.Entry(frame_senha, textvariable=self.var_senha,
+        frame_s = tk.Frame(frame, bg=COR_BG)
+        frame_s.grid(row=12, column=1, sticky="w")
+        self.ent_senha = tk.Entry(frame_s, textvariable=self.var_senha,
                                    bg=COR_CAMPO, fg=COR_TEXTO, show="*",
                                    insertbackground=COR_TEXTO, font=("Consolas", 10),
                                    relief="flat", width=20)
         self.ent_senha.pack(side="left")
-        tk.Button(frame_senha, text="Mostrar", bg=COR_CAMPO, fg=COR_LABEL,
+        tk.Button(frame_s, text="Mostrar", bg=COR_CAMPO, fg=COR_LABEL,
                   font=("Consolas", 8), relief="flat", cursor="hand2",
                   command=self._toggle_senha).pack(side="left", padx=4)
 
-        # Barra de progresso
+        # Progresso
         self._var_prog = tk.DoubleVar(value=0)
         self._var_desc = tk.StringVar(value="Aguardando...")
         tk.Label(self, textvariable=self._var_desc, bg=COR_BG, fg=COR_LABEL,
@@ -573,6 +554,7 @@ class AppSCPO(tk.Tk):
         # Botões
         frame_btn = tk.Frame(self, bg=COR_BG)
         frame_btn.pack(pady=6)
+
         self._btn_run = tk.Button(frame_btn, text="▶  Automatizar SCPO",
                                    bg=COR_BOTAO, fg=COR_TEXTO,
                                    font=("Consolas", 11, "bold"),
@@ -580,8 +562,17 @@ class AppSCPO(tk.Tk):
                                    padx=16, pady=6, command=self._iniciar)
         self._btn_run.pack(side="left", padx=6)
 
+        self._btn_captcha = tk.Button(frame_btn,
+                                       text="Codigo digitado — Continuar",
+                                       bg="#27ae60", fg=COR_TEXTO,
+                                       font=("Consolas", 10), relief="flat",
+                                       cursor="hand2", padx=12, pady=6,
+                                       state="disabled",
+                                       command=self._liberar_captcha)
+        self._btn_captcha.pack(side="left", padx=6)
+
         self._btn_senha_ok = tk.Button(frame_btn,
-                                        text="✔ Senha alterada — Continuar",
+                                        text="Senha alterada — Continuar",
                                         bg="#e67e22", fg=COR_TEXTO,
                                         font=("Consolas", 10), relief="flat",
                                         cursor="hand2", padx=12, pady=6,
@@ -605,25 +596,22 @@ class AppSCPO(tk.Tk):
         if not d:
             messagebox.showwarning("CEP", f"CEP {cep} nao encontrado.")
             return
-        rua = d.get("logradouro", "")
         self.ent_rua.delete(0, "end")
-        self.ent_rua.insert(0, rua.upper())
-        bairro = d.get("bairro", "")
-        cidade = d.get("localidade", "")
-        uf     = d.get("uf", "")
-        self._lbl_cep_status.config(text=f"✔ {bairro} — {cidade}/{uf}")
+        self.ent_rua.insert(0, d.get("logradouro", "").upper())
+        self._lbl_cep.config(
+            text=f"✔ {d.get('bairro','')} — {d.get('localidade','')}/{d.get('uf','')}")
 
     def _toggle_esquina(self):
         self.ent_rua2.config(state="normal" if self.var_esquina.get() else "disabled")
-        self._atualizar_casas_esquina()
+        self._atualizar_casas()
 
-    def _atualizar_casas_esquina(self, event=None):
+    def _atualizar_casas(self, event=None):
         for w in self.frame_casas.winfo_children():
             w.destroy()
         self._entries_rua_casa = []
         if not self.var_esquina.get(): return
         try:
-            n = int(self.ent_num_casas.get())
+            n = int(self.ent_ncasas.get())
         except ValueError:
             return
         tk.Label(self.frame_casas, text="Rua por casa:",
@@ -640,53 +628,61 @@ class AppSCPO(tk.Tk):
             self._entries_rua_casa.append(e)
 
     def _toggle_senha(self):
-        self.ent_senha.config(show="" if self.ent_senha.cget("show") == "*" else "*")
+        self.ent_senha.config(
+            show="" if self.ent_senha.cget("show") == "*" else "*")
 
     def _log(self, msg):
         self.after(0, self._log_direto, msg)
 
     def _log_direto(self, msg):
         self._txt_log.config(state="normal")
-        self._txt_log.insert("end", f"{datetime.now().strftime('%H:%M:%S')}  {msg}\n")
+        self._txt_log.insert("end",
+            f"{datetime.now().strftime('%H:%M:%S')}  {msg}\n")
         self._txt_log.see("end")
         self._txt_log.config(state="disabled")
 
     def _step(self, pct, desc):
-        self.after(0, lambda: (self._var_prog.set(pct), self._var_desc.set(desc)))
+        self.after(0, lambda: (
+            self._var_prog.set(pct), self._var_desc.set(desc)))
 
     def _done(self, ok, msg):
         self.after(0, self._done_ui, ok, msg)
 
     def _done_ui(self, ok, msg):
         self._btn_run.config(state="normal")
+        self._btn_captcha.config(state="disabled")
         self._btn_senha_ok.config(state="disabled")
         (messagebox.showinfo if ok else messagebox.showerror)(
             "Concluido" if ok else "Erro", msg)
 
+    def _liberar_captcha(self):
+        self._evento_captcha.set()
+        self._btn_captcha.config(state="disabled")
+        self._log_direto("Codigo de seguranca confirmado.")
+
     def _liberar_senha(self):
-        nova = simpledialog.askstring("Nova Senha",
-                                      "Digite a nova senha cadastrada:", parent=self)
+        nova = simpledialog.askstring(
+            "Nova Senha", "Digite a nova senha cadastrada:", parent=self)
         if nova:
             self._nova_senha_tmp = nova
             self.var_senha.set(nova)
             self._evento_senha.set()
             self._btn_senha_ok.config(state="disabled")
-            self._log_direto("Nova senha registrada.")
 
     # ── Validação e início ────────────────────────────────────────────────────
     def _validar(self):
         for v, n in [
-            (self.ent_cep.get().strip(),      "CEP"),
-            (self.ent_rua.get().strip(),       "Rua Principal"),
-            (self.ent_quadra.get().strip(),    "Quadra"),
-            (self.ent_lote.get().strip(),      "Lote"),
-            (self.ent_num_casas.get().strip(), "Nr de Casas"),
-            (self.var_data_ini.get().strip(),  "Data de Inicio"),
+            (self.ent_cep.get().strip(),     "CEP"),
+            (self.ent_rua.get().strip(),      "Rua Principal"),
+            (self.ent_quadra.get().strip(),   "Quadra"),
+            (self.ent_lote.get().strip(),     "Lote"),
+            (self.ent_ncasas.get().strip(),   "Nr de Casas"),
+            (self.var_data_ini.get().strip(), "Data de Inicio"),
         ]:
             if not v:
                 return False, f"Campo obrigatorio vazio: {n}"
         try:
-            assert int(self.ent_num_casas.get()) >= 1
+            assert int(self.ent_ncasas.get()) >= 1
         except Exception:
             return False, "Nr de Casas deve ser inteiro positivo."
         try:
@@ -709,46 +705,49 @@ class AppSCPO(tk.Tk):
             messagebox.showwarning("Campo invalido", err)
             return
         salvar_config({"senha": self.var_senha.get().strip()})
-        n = int(self.ent_num_casas.get())
+        n = int(self.ent_ncasas.get())
         casas = [{"numero": i+1,
                   "rua": (self._entries_rua_casa[i].get().strip()
-                          if self.var_esquina.get() and i < len(self._entries_rua_casa) else "")}
+                          if self.var_esquina.get() and
+                          i < len(self._entries_rua_casa) else "")}
                  for i in range(n)]
-
-        self._dados_run = {
-            "nome_obra":      montar_nome_obra(self.ent_rua.get().strip(),
-                                               self.ent_quadra.get().strip(),
-                                               self.ent_lote.get().strip()),
-            "rua":            self.ent_rua.get().strip(),
-            "rua2":           self.ent_rua2.get().strip(),
-            "quadra":         self.ent_quadra.get().strip(),
-            "lote":           self.ent_lote.get().strip(),
-            "cep":            self.ent_cep.get().strip(),
-            "esquina":        self.var_esquina.get(),
-            "casas":          casas,
-            "data_inicio":    self.var_data_ini.get().strip(),
-            "data_termino":   data_termino_auto(),
-            "observacao":     gerar_observacao(
-                                  self.ent_rua.get().strip(),
-                                  self.ent_quadra.get().strip(),
-                                  self.ent_lote.get().strip(),
-                                  self.var_esquina.get(),
-                                  self.ent_rua2.get().strip(),
-                                  casas),
-            "pasta_download": self.ent_pasta.get().strip(),
-            "evento_captcha":    self._evento_captcha,
-            "evento_senha":      self._evento_senha,
-            "fn_mostrar_captcha": lambda img: self.after(0, self._mostrar_janela_captcha, img),
-            "nova_senha":            self._nova_senha_tmp,
-            "captcha_img_bytes":     b"",
-            "captcha_valor":         "",
-        }
 
         self._evento_captcha.clear()
         self._evento_senha.clear()
 
+        dados = {
+            "nome_obra":    montar_nome_obra(self.ent_rua.get().strip(),
+                                             self.ent_quadra.get().strip(),
+                                             self.ent_lote.get().strip()),
+            "rua":          self.ent_rua.get().strip(),
+            "rua2":         self.ent_rua2.get().strip(),
+            "quadra":       self.ent_quadra.get().strip(),
+            "lote":         self.ent_lote.get().strip(),
+            "cep":          self.ent_cep.get().strip(),
+            "esquina":      self.var_esquina.get(),
+            "casas":        casas,
+            "data_inicio":  self.var_data_ini.get().strip(),
+            "data_termino": data_termino_auto(),
+            "observacao":   gerar_observacao(
+                                self.ent_rua.get().strip(),
+                                self.ent_quadra.get().strip(),
+                                self.ent_lote.get().strip(),
+                                self.var_esquina.get(),
+                                self.ent_rua2.get().strip(),
+                                casas),
+            "pasta_download": self.ent_pasta.get().strip(),
+            "evento_captcha": self._evento_captcha,
+            "evento_senha":   self._evento_senha,
+            "nova_senha":     self._nova_senha_tmp,
+            "fn_habilitar_captcha": lambda: self.after(
+                0, lambda: self._btn_captcha.config(state="normal")),
+            "fn_habilitar_senha": lambda: self.after(
+                0, lambda: self._btn_senha_ok.config(state="normal")),
+        }
+
         self._btn_run.config(state="disabled")
-        self._btn_senha_ok.config(state="normal")
+        self._btn_captcha.config(state="disabled")
+        self._btn_senha_ok.config(state="disabled")
         self._var_prog.set(0)
         self._var_desc.set("Iniciando...")
         self._txt_log.config(state="normal")
@@ -757,7 +756,7 @@ class AppSCPO(tk.Tk):
 
         threading.Thread(
             target=executar_scpo,
-            args=(self._dados_run, self.var_senha.get().strip(),
+            args=(dados, self.var_senha.get().strip(),
                   self._step, self._log, self._done),
             daemon=True
         ).start()

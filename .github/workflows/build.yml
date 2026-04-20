@@ -20,10 +20,17 @@ jobs:
         run: pip install selenium webdriver-manager python-dateutil pyinstaller
 
       - name: Gerar EXE
-        run: |
-          python -m PyInstaller --onefile --windowed `
-            --name "SCPO_Automation" `
-            scpo_app.py
+        run: >
+          python -m PyInstaller --onefile --windowed
+          --name "SCPO_Automation"
+          --collect-all selenium
+          --collect-all webdriver_manager
+          --hidden-import selenium.webdriver.chrome.options
+          --hidden-import selenium.webdriver.chrome.service
+          --hidden-import selenium.webdriver.support.ui
+          --hidden-import selenium.webdriver.support.expected_conditions
+          --hidden-import dateutil.relativedelta
+          scpo_app.py
 
       - uses: actions/upload-artifact@v4
         with:

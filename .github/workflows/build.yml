@@ -1,4 +1,4 @@
-name: Gerar EXE - SCPO Automation
+name: Gerar EXE - SCPO Login Test
 
 on:
   push:
@@ -17,22 +17,21 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install selenium python-dateutil pyinstaller
+        run: pip install selenium pyinstaller
 
       - name: Gerar EXE
         run: >
           python -m PyInstaller --onefile --windowed
-          --name "SCPO_Automation"
+          --name "SCPO_LoginTest"
           --collect-all selenium
           --hidden-import selenium.webdriver.edge.options
           --hidden-import selenium.webdriver.edge.service
           --hidden-import selenium.webdriver.support.ui
           --hidden-import selenium.webdriver.support.expected_conditions
-          --hidden-import dateutil.relativedelta
           scpo_app.py
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SCPO_Automation-Windows
-          path: dist/SCPO_Automation.exe
+          name: SCPO_LoginTest-Windows
+          path: dist/SCPO_LoginTest.exe
           retention-days: 30

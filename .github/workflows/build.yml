@@ -17,14 +17,13 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install selenium webdriver-manager python-dateutil pyinstaller
+        run: pip install selenium python-dateutil pyinstaller
 
       - name: Gerar EXE
         run: >
           python -m PyInstaller --onefile --windowed
           --name "SCPO_Automation"
           --collect-all selenium
-          --collect-all webdriver_manager
           --hidden-import selenium.webdriver.chrome.options
           --hidden-import selenium.webdriver.chrome.service
           --hidden-import selenium.webdriver.support.ui

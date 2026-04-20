@@ -191,9 +191,20 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
         step_cb(10, "Aguardando captcha")
 
         img_bytes = b""
+        # Log dos primeiros 500 chars do HTML para diagnóstico
+        log_cb(f"HTML recebido ({len(html_login)} chars): {html_login[:300].replace(chr(10),' ')}")
+
         m = re.search(r'src="(CaptchaImage\.axd\?[^"]+)"', html_login, re.IGNORECASE)
+        if not m:
+            # Tenta padrão alternativo
+            m = re.search(r"src='(CaptchaImage\.axd\?[^']+)'", html_login, re.IGNORECASE)
+        if not m:
+            # Tenta qualquer referência ao captcha
+            m = re.search("(CaptchaImage[^ \"]+)", html_login, re.IGNORECASE)
+
         if m:
-            url_captcha = URL_BASE + "/" + m.group(1)
+            raw_url = m.group(1)
+            url_captcha = (URL_BASE + "/" + raw_url) if not raw_url.startswith("http") else raw_url
             log_cb(f"Captcha URL: {url_captcha}")
             try:
                 img_bytes = sessao.get_imagem_captcha(url_captcha)
@@ -201,7 +212,18 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
             except Exception as ex:
                 log_cb(f"Erro ao baixar captcha: {ex}")
         else:
-            log_cb("⚠ URL do captcha nao encontrada no HTML — verifique o site.")
+            log_cb("⚠ Captcha nao encontrado. HTML dump salvo no relatorio.")
+            # Salva HTML completo para análise
+            try:
+                log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SCPOApp")
+                os.makedirs(log_dir, exist_ok=True)
+                html_path = os.path.join(log_dir, "html_login_debug.html")
+                with open(html_path, "w", encoding="utf-8") as hf:
+                    hf.write(html_login)
+                log_cb(f"HTML salvo em: {html_path}")
+                log_cb("Abra esse arquivo no navegador para ver o que o site retornou.")
+            except Exception:
+                pass
 
         # Dispara popup via callback para a UI (thread-safe)
         dados["captcha_img_bytes"] = img_bytes

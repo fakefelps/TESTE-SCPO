@@ -241,18 +241,24 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
         wait = WebDriverWait(driver, 20)
 
         # 2. Login ────────────────────────────────────────────────────────────
+        # Seletores confirmados via DevTools (IDs reais do site SCPO)
         log_cb(f"Abrindo {URL_SCPO}...")
         step_cb(10, "Abrindo SCPO")
         driver.get(URL_SCPO)
-        wait.until(EC.presence_of_element_located((By.NAME, "login"))).send_keys(LOGIN_CPF)
-        driver.find_element(By.NAME, "senha").send_keys(senha)
+
+        wait.until(EC.presence_of_element_located(
+            (By.ID, "PlaceHolderConteudo_txtCPF"))).send_keys(LOGIN_CPF)
+        driver.find_element(
+            By.ID, "PlaceHolderConteudo_txtSenha").send_keys(senha)
+
         log_cb("Login e senha preenchidos.")
-        log_cb(">>> Digite o código de segurança no navegador e clique 'Código digitado — Continuar'")
-        step_cb(15, "Aguardando código de segurança")
+        log_cb(">>> Digite o codigo de seguranca no navegador e clique 'Codigo digitado - Continuar'")
+        step_cb(15, "Aguardando codigo de seguranca")
         dados["evento_captcha"].wait()
-        log_cb("Código confirmado. Clicando em Entrar...")
+
+        log_cb("Codigo confirmado. Clicando em Entrar...")
         step_cb(20, "Efetuando login")
-        driver.find_element(By.NAME, "entrar").click()
+        driver.find_element(By.ID, "PlaceHolderConteudo_btnLogin").click()
         time.sleep(2)
 
         # Verifica pedido de troca de senha
@@ -265,23 +271,32 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
 
         # 3. Comunicação > Comunicar Obra ─────────────────────────────────────
         step_cb(30, "Navegando para Comunicar Obra")
-        log_cb("Clicando em Comunicação > Comunicar Obra...")
-        wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Comunicação"))).click()
-        wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Comunicar Obra"))).click()
+        log_cb("Abrindo menu Comunicacao...")
+        # Menu usa onclick AbreTR — clicar no <a> que expande subMenu01
+        wait.until(EC.element_to_be_clickable(
+            (By.XPATH, "//a[contains(@onclick,'subMenu01')]"))).click()
+        time.sleep(1)
+        # Link direto para a página de Comunicar Obra
+        wait.until(EC.element_to_be_clickable(
+            (By.XPATH, "//a[contains(@href,'DeclaracaoPreviaObra/Comunicar')]"))).click()
 
         # 4. Identificação da empresa ─────────────────────────────────────────
         step_cb(35, "Identificando empresa")
-        log_cb("Marcando 'Obra não tem CNPJ'...")
+        log_cb("Marcando Obra nao tem CNPJ...")
+        # IDs confirmados via DevTools
         chk = wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//input[@type='checkbox' and contains(@id,'semCnpj')]")))
+            (By.ID, "PlaceHolderConteudo_chkObraSemCNPJ")))
         if not chk.is_selected():
             chk.click()
-        f = wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//input[contains(@id,'cpfProprietario') or contains(@name,'cpfProprietario')]")))
-        f.clear(); f.send_keys(LOGIN_CPF)
+        time.sleep(1)  # aguarda postback que desbloqueia campo CPF
+
+        cpf_field = wait.until(EC.element_to_be_clickable(
+            (By.ID, "txtCPFProprietarioObra")))
+        cpf_field.clear()
+        cpf_field.send_keys(LOGIN_CPF)
+
         wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//input[@type='submit' and contains(@value,'Comunicar')] | "
-                       "//button[contains(text(),'Comunicar Obra')]"))).click()
+            (By.ID, "PlaceHolderConteudo_btnDeclararObra"))).click()
 
         # 5. Formulário ───────────────────────────────────────────────────────
         step_cb(45, "Preenchendo formulário")

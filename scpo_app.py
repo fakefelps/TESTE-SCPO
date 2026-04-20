@@ -96,6 +96,125 @@ def data_termino_auto() -> str:
     return (datetime.today() + relativedelta(months=1)).strftime("%d/%m/%Y")
 
 
+
+# ─── ChromeDriver — detecção e download automático ────────────────────────────
+
+def _detectar_versao_chrome(log_cb=None) -> str:
+    """
+    Detecta a versão do Chrome instalado no Windows via registro.
+    Retorna string tipo '124.0.6367.78'. Lança RuntimeError se não encontrar.
+    """
+    import winreg
+    chaves = [
+        r"SOFTWARE\Google\Chrome\BLBeacon",
+        r"SOFTWARE\Wow6432Node\Google\Chrome\BLBeacon",
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+    ]
+    for chave in chaves:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, chave) as k:
+                versao, _ = winreg.QueryValueEx(k, "version")
+                return versao
+        except Exception:
+            pass
+    # Fallback: tentar via powershell
+    try:
+        import subprocess
+        resultado = subprocess.check_output(
+            ['powershell', '-command',
+             '(Get-Item "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe").VersionInfo.FileVersion'],
+            stderr=subprocess.DEVNULL, timeout=5
+        ).decode().strip()
+        if resultado:
+            return resultado
+    except Exception:
+        pass
+    raise RuntimeError(
+        "Chrome não encontrado no sistema. Instale o Google Chrome e tente novamente."
+    )
+
+
+def _garantir_chromedriver(chrome_version: str, log_cb=None) -> str:
+    """
+    Garante que o ChromeDriver compatível com chrome_version está disponível.
+    Salva em %LOCALAPPDATA%/SCPODriver/chromedriver.exe.
+    Baixa apenas se necessário (compara versão major).
+    """
+    import zipfile, urllib.request, json as _json
+    major = chrome_version.split(".")[0]
+
+    # Pasta de destino
+    driver_dir = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+        "SCPODriver"
+    )
+    os.makedirs(driver_dir, exist_ok=True)
+    driver_path = os.path.join(driver_dir, "chromedriver.exe")
+    versao_txt  = os.path.join(driver_dir, "versao.txt")
+
+    # Verifica se já temos o driver correto em cache
+    if os.path.exists(driver_path) and os.path.exists(versao_txt):
+        with open(versao_txt) as f:
+            cached = f.read().strip()
+        if cached.startswith(major + "."):
+            if log_cb: log_cb(f"ChromeDriver em cache: {cached} — reutilizando.")
+            return driver_path
+
+    # Chrome 115+ usa a nova API CfT (Chrome for Testing)
+    if int(major) >= 115:
+        if log_cb: log_cb(f"Buscando ChromeDriver {major} via API Chrome for Testing...")
+        api_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+        with urllib.request.urlopen(api_url, timeout=15) as r:
+            dados = _json.loads(r.read())
+
+        # Encontra a versão mais recente do mesmo major
+        versao_driver = None
+        url_zip = None
+        for v in reversed(dados["versions"]):
+            if v["version"].startswith(major + "."):
+                downloads = v.get("downloads", {}).get("chromedriver", [])
+                for d in downloads:
+                    if d["platform"] == "win64":
+                        versao_driver = v["version"]
+                        url_zip = d["url"]
+                        break
+                if url_zip:
+                    break
+
+        if not url_zip:
+            raise RuntimeError(
+                f"ChromeDriver para Chrome {major} nao encontrado na API Google. "
+                f"Versao do Chrome: {chrome_version}"
+            )
+    else:
+        # Chrome < 115 — API antiga
+        if log_cb: log_cb(f"Buscando ChromeDriver {major} via API legada...")
+        url_versao = f"https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{major}"
+        with urllib.request.urlopen(url_versao, timeout=10) as r:
+            versao_driver = r.read().decode().strip()
+        url_zip = f"https://chromedriver.storage.googleapis.com/{versao_driver}/chromedriver_win32.zip"
+
+    if log_cb: log_cb(f"Baixando ChromeDriver {versao_driver}...")
+    zip_path = os.path.join(driver_dir, "chromedriver.zip")
+    urllib.request.urlretrieve(url_zip, zip_path)
+
+    # Extrai chromedriver.exe
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for nome in z.namelist():
+            if nome.endswith("chromedriver.exe"):
+                with z.open(nome) as src_f, open(driver_path, "wb") as dst_f:
+                    dst_f.write(src_f.read())
+                break
+    os.remove(zip_path)
+
+    # Salva versão em cache
+    with open(versao_txt, "w") as f:
+        f.write(versao_driver)
+
+    if log_cb: log_cb(f"ChromeDriver {versao_driver} instalado em {driver_dir}")
+    return driver_path
+
+
 # ─── Automação Selenium ───────────────────────────────────────────────────────
 def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
     import time
@@ -111,9 +230,13 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
             "download.prompt_for_download": False,
             "plugins.always_open_pdf_externally": True,
         })
-        # Selenium 4.6+ detecta ChromeDriver automaticamente via Selenium Manager
-        # Não precisa de webdriver-manager nem ChromeDriver instalado manualmente
-        driver = webdriver.Chrome(options=options)
+        # ── Solução definitiva: detectar versão do Chrome e baixar ChromeDriver exato ──
+        log_cb("Detectando versão do Chrome instalado...")
+        chrome_version = _detectar_versao_chrome(log_cb)
+        log_cb(f"Chrome detectado: {chrome_version}")
+        chromedriver_path = _garantir_chromedriver(chrome_version, log_cb)
+        log_cb(f"ChromeDriver: {chromedriver_path}")
+        driver = webdriver.Chrome(service=Service(chromedriver_path), options=options)
         wait = WebDriverWait(driver, 20)
 
         # 2. Login ────────────────────────────────────────────────────────────
@@ -305,8 +428,25 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
         done_cb(True, "SCPO preenchido com sucesso!")
 
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         log_cb(f"✖ ERRO: {e}")
-        done_cb(False, str(e))
+        log_cb("── Traceback completo ──")
+        for linha in tb.splitlines():
+            log_cb(linha)
+        # Exportar relatório de erro
+        try:
+            log_path = os.path.join(
+                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                "SCPODriver", f"erro_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            )
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "w", encoding="utf-8") as lf:
+                lf.write(f"Erro: {e}\n\n{tb}")
+            log_cb(f"Relatório salvo em: {log_path}")
+        except Exception:
+            pass
+        done_cb(False, f"{e}\n\nRelatório salvo em:\n%LOCALAPPDATA%\\SCPODriver\\")
     # Navegador permanece aberto para conferência
 
 

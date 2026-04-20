@@ -190,16 +190,24 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
         log_cb("Extraindo captcha...")
         step_cb(10, "Aguardando captcha")
 
-        # URL da imagem do captcha está em <img src="CaptchaImage.axd?guid=...">
+        img_bytes = b""
         m = re.search(r'src="(CaptchaImage\.axd\?[^"]+)"', html_login, re.IGNORECASE)
         if m:
             url_captcha = URL_BASE + "/" + m.group(1)
-            img_bytes = sessao.get_imagem_captcha(url_captcha)
-            # Envia imagem para UI exibir
-            dados["captcha_img_bytes"] = img_bytes
-            dados["evento_mostrar_captcha"].set()
+            log_cb(f"Captcha URL: {url_captcha}")
+            try:
+                img_bytes = sessao.get_imagem_captcha(url_captcha)
+                log_cb(f"Imagem captcha: {len(img_bytes)} bytes")
+            except Exception as ex:
+                log_cb(f"Erro ao baixar captcha: {ex}")
+        else:
+            log_cb("⚠ URL do captcha nao encontrada no HTML — verifique o site.")
 
-        log_cb(">>> Veja o captcha no app, digite e clique 'Confirmar'")
+        # Dispara popup via callback para a UI (thread-safe)
+        dados["captcha_img_bytes"] = img_bytes
+        dados["fn_mostrar_captcha"](img_bytes)  # chama diretamente a UI
+
+        log_cb(">>> Janela do captcha aberta no app — digite e clique Confirmar")
         dados["evento_captcha"].wait()  # aguarda usuário digitar
         captcha_digitado = dados.get("captcha_valor", "")
         log_cb(f"Captcha recebido: {captcha_digitado}")
@@ -376,22 +384,10 @@ class AppSCPO(tk.Tk):
         self.var_esquina     = tk.BooleanVar(value=False)
         self.var_data_ini    = tk.StringVar()
         self.var_senha       = tk.StringVar(value=self.config_dados.get("senha", "SCPO123"))
-        self._evento_captcha       = threading.Event()
-        self._evento_mostrar_captcha = threading.Event()
-        self._evento_senha         = threading.Event()
+        self._evento_captcha = threading.Event()
+        self._evento_senha   = threading.Event()
         self._nova_senha_tmp       = ""
         self._build_ui()
-        # Inicia watcher que mostra captcha quando disponível
-        threading.Thread(target=self._aguardar_captcha_img, daemon=True).start()
-
-    # ── Watcher: exibe janela de captcha quando a imagem chegar ──────────────
-    def _aguardar_captcha_img(self):
-        while True:
-            self._evento_mostrar_captcha.wait()
-            self._evento_mostrar_captcha.clear()
-            img_bytes = self._dados_run.get("captcha_img_bytes", b"")
-            if img_bytes:
-                self.after(0, self._mostrar_janela_captcha, img_bytes)
 
     def _mostrar_janela_captcha(self, img_bytes: bytes):
         """Abre popup com imagem do captcha e campo para digitar."""
@@ -718,16 +714,15 @@ class AppSCPO(tk.Tk):
                                   self.ent_rua2.get().strip(),
                                   casas),
             "pasta_download": self.ent_pasta.get().strip(),
-            "evento_captcha":        self._evento_captcha,
-            "evento_mostrar_captcha": self._evento_mostrar_captcha,
-            "evento_senha":          self._evento_senha,
+            "evento_captcha":    self._evento_captcha,
+            "evento_senha":      self._evento_senha,
+            "fn_mostrar_captcha": lambda img: self.after(0, self._mostrar_janela_captcha, img),
             "nova_senha":            self._nova_senha_tmp,
             "captcha_img_bytes":     b"",
             "captcha_valor":         "",
         }
 
         self._evento_captcha.clear()
-        self._evento_mostrar_captcha.clear()
         self._evento_senha.clear()
 
         self._btn_run.config(state="disabled")

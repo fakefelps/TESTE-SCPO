@@ -17,15 +17,17 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install python-dateutil Pillow pyinstaller
+        run: pip install selenium python-dateutil pyinstaller
 
       - name: Gerar EXE
         run: >
           python -m PyInstaller --onefile --windowed
           --name "SCPO_Automation"
-          --hidden-import PIL._imaging
-          --hidden-import PIL.Image
-          --hidden-import PIL.ImageTk
+          --collect-all selenium
+          --hidden-import selenium.webdriver.edge.options
+          --hidden-import selenium.webdriver.edge.service
+          --hidden-import selenium.webdriver.support.ui
+          --hidden-import selenium.webdriver.support.expected_conditions
           --hidden-import dateutil.relativedelta
           scpo_app.py
 

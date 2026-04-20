@@ -8,6 +8,7 @@ import threading
 import json
 import os
 import sys
+import urllib.request
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
@@ -88,8 +89,23 @@ def gerar_observacao(residencial: str, rua: str, quadra: str, lote: str,
     return obs
 
 def nome_obra(residencial: str, rua: str, quadra: str, lote: str) -> str:
-    """Monta o nome da obra conforme padrão."""
-    return f"{residencial.upper()} {rua.upper()} QUADRA {quadra.upper()} LOTE {lote.upper()}"
+    """Monta o nome da obra conforme padrão: RESIDENCIAL X RUA Y QUADRA Z LOTE W."""
+    return f"RESIDENCIAL {residencial.upper()} {rua.upper()} QUADRA {quadra.upper()} LOTE {lote.upper()}"
+
+def buscar_cep(cep: str) -> dict:
+    """Consulta ViaCEP. Retorna dict com logradouro, bairro, localidade, uf ou {} se falhar."""
+    cep_limpo = cep.replace("-", "").replace(".", "").strip()
+    if len(cep_limpo) != 8:
+        return {}
+    try:
+        url = f"https://viacep.com.br/ws/{cep_limpo}/json/"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            dados = json.loads(resp.read().decode())
+        if "erro" in dados:
+            return {}
+        return dados
+    except Exception:
+        return {}
 
 def data_termino_auto() -> str:
     """Retorna data de término = 1 mês após hoje, formato DD/MM/YYYY."""
@@ -422,20 +438,38 @@ class AppSCPO(tk.Tk):
             return e
 
         # ── Campos de dados da obra ──
-        label(0, "Residencial:")
+        # "Residencial" = apenas o nome (ex: TUPINIQUIM). App monta "RESIDENCIAL X RUA Y QD Z LT W"
+        label(0, "Nome Residencial:")
         self.ent_residencial = entry(0)
+        tk.Label(frame, text="(só o nome, ex: TUPINIQUIM)", bg=COR_BG, fg=COR_LABEL,
+                 font=("Consolas", 7)).grid(row=0, column=1, sticky="e")
 
-        label(1, "Rua Principal:")
-        self.ent_rua = entry(1)
+        # CEP com botão Buscar — preenche Rua automaticamente
+        label(1, "CEP:")
+        frame_cep = tk.Frame(frame, bg=COR_BG)
+        frame_cep.grid(row=1, column=1, sticky="w", pady=3)
+        self.ent_cep = tk.Entry(frame_cep, bg=COR_CAMPO, fg=COR_TEXTO,
+                                 insertbackground=COR_TEXTO, font=("Consolas", 10),
+                                 relief="flat", width=12)
+        self.ent_cep.pack(side="left")
+        self.ent_cep.bind("<FocusOut>", lambda e: self._buscar_cep())
+        tk.Button(frame_cep, text="Buscar", bg=COR_BOTAO, fg=COR_TEXTO,
+                  font=("Consolas", 9), relief="flat", cursor="hand2",
+                  command=self._buscar_cep).pack(side="left", padx=6)
 
-        label(2, "Quadra:")
-        self.ent_quadra = entry(2, width=10)
+        label(2, "Rua Principal:")
+        self.ent_rua = tk.Entry(frame, bg=COR_CAMPO, fg=COR_LOG_TEXT,
+                                 insertbackground=COR_TEXTO, font=("Consolas", 10),
+                                 relief="flat", width=32)
+        self.ent_rua.grid(row=2, column=1, sticky="w", pady=3)
+        tk.Label(frame, text="(preenchida pelo CEP)", bg=COR_BG, fg=COR_LABEL,
+                 font=("Consolas", 7)).grid(row=2, column=1, sticky="e")
 
-        label(3, "Lote:")
-        self.ent_lote = entry(3, width=10)
+        label(3, "Quadra:")
+        self.ent_quadra = entry(3, width=10)
 
-        label(4, "CEP:")
-        self.ent_cep = entry(4, width=12)
+        label(4, "Lote:")
+        self.ent_lote = entry(4, width=10)
 
         label(5, "Nº de Casas:")
         self.ent_num_casas = entry(5, width=5)
@@ -551,6 +585,21 @@ class AppSCPO(tk.Tk):
         self._txt_log.pack(fill="x", padx=PAD, pady=(0, PAD))
 
     # ─── Helpers de UI ────────────────────────────────────────────────────────
+
+    def _buscar_cep(self):
+        """Consulta ViaCEP e preenche campo Rua automaticamente."""
+        cep = self.ent_cep.get().strip()
+        if not cep:
+            return
+        dados = buscar_cep(cep)
+        if not dados:
+            messagebox.showwarning("CEP não encontrado", f"CEP {cep} não localizado. Verifique e tente novamente.")
+            return
+        # Preenche Rua (logradouro)
+        rua = dados.get("logradouro", "")
+        self.ent_rua.config(state="normal")
+        self.ent_rua.delete(0, "end")
+        self.ent_rua.insert(0, rua.upper())
 
     def _toggle_esquina(self):
         """Habilita/desabilita campo de rua 2 e campos de rua por casa."""

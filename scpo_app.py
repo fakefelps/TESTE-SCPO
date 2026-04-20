@@ -15,11 +15,9 @@ from dateutil.relativedelta import relativedelta
 # ─── Selenium (imports explícitos — obrigatório para PyInstaller não cortar) ──
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions  # import direto evita "No module named"
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ─── Constantes fixas ────────────────────────────────────────────────────────
 URL_SCPO      = "https://scpo.mte.gov.br/"
@@ -113,10 +111,9 @@ def executar_scpo(dados: dict, senha: str, step_cb, log_cb, done_cb):
             "download.prompt_for_download": False,
             "plugins.always_open_pdf_externally": True,
         })
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager(driver_version=None).install()),
-            options=options
-        )
+        # Selenium 4.6+ detecta ChromeDriver automaticamente via Selenium Manager
+        # Não precisa de webdriver-manager nem ChromeDriver instalado manualmente
+        driver = webdriver.Chrome(options=options)
         wait = WebDriverWait(driver, 20)
 
         # 2. Login ────────────────────────────────────────────────────────────

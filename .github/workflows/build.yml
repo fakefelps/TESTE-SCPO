@@ -19,43 +19,16 @@ jobs:
       - name: Instalar dependencias
         run: pip install playwright pillow pyinstaller
 
-      - name: Instalar Chromium bundled
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
-        run: python -m playwright install chromium
-
       - name: Build EXE
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
-        shell: pwsh
-        run: |
-          # Localiza pasta do Chromium instalado
-          $browsers = "$env:pythonLocation\Lib\site-packages\playwright\driver\package\.local-browsers"
-          Write-Host "Browsers path: $browsers"
-          Write-Host "Contents:"
-          Get-ChildItem $browsers | ForEach-Object { Write-Host " - $($_.Name)" }
-
-          # Monta o --add-data para incluir os binários do Chromium
-          $addData = "$browsers;playwright/driver/package/.local-browsers"
-
-          python -m PyInstaller --onedir --windowed `
-            --name "SCPO_LoginTest" `
-            --collect-all playwright `
-            --add-data "$addData" `
-            --hidden-import PIL._imaging `
-            --hidden-import PIL.Image `
-            --hidden-import PIL.ImageTk `
-            --noupx `
-            scpo_app.py
-
-      - name: Verificar Chromium no dist
-        shell: pwsh
-        run: |
-          $dist = "dist\SCPO_LoginTest\_internal\playwright\driver\package\.local-browsers"
-          Write-Host "Chromium no dist existe: $(Test-Path $dist)"
-          if (Test-Path $dist) {
-            Get-ChildItem $dist | ForEach-Object { Write-Host " - $($_.Name)" }
-          }
+        run: >
+          python -m PyInstaller --onedir --windowed
+          --name "SCPO_LoginTest"
+          --collect-all playwright
+          --hidden-import PIL._imaging
+          --hidden-import PIL.Image
+          --hidden-import PIL.ImageTk
+          --noupx
+          scpo_app.py
 
       - uses: actions/upload-artifact@v4
         with:

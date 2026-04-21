@@ -22,43 +22,40 @@ jobs:
       - name: Instalar Chromium bundled
         env:
           PLAYWRIGHT_BROWSERS_PATH: "0"
-        run: |
-          python -m playwright install chromium
-          python -c "
-          import os, sys
-          from pathlib import Path
-          sp = Path(sys.prefix) / 'Lib' / 'site-packages'
-          browsers = sp / 'playwright' / 'driver' / 'package' / '.local-browsers'
-          print('Browsers path:', browsers)
-          print('Exists:', browsers.exists())
-          if browsers.exists():
-              for item in browsers.iterdir():
-                  print(' -', item.name)
-          "
+        run: python -m playwright install chromium
 
       - name: Build EXE
         env:
           PLAYWRIGHT_BROWSERS_PATH: "0"
-        run: >
-          python -m PyInstaller --onedir --windowed
-          --name "SCPO_LoginTest"
-          --collect-all playwright
-          --hidden-import PIL._imaging
-          --hidden-import PIL.Image
-          --hidden-import PIL.ImageTk
-          --noupx
-          scpo_app.py
+        shell: pwsh
+        run: |
+          # Localiza pasta do Chromium instalado
+          $browsers = "$env:pythonLocation\Lib\site-packages\playwright\driver\package\.local-browsers"
+          Write-Host "Browsers path: $browsers"
+          Write-Host "Contents:"
+          Get-ChildItem $browsers | ForEach-Object { Write-Host " - $($_.Name)" }
+
+          # Monta o --add-data para incluir os binários do Chromium
+          $addData = "$browsers;playwright/driver/package/.local-browsers"
+
+          python -m PyInstaller --onedir --windowed `
+            --name "SCPO_LoginTest" `
+            --collect-all playwright `
+            --add-data "$addData" `
+            --hidden-import PIL._imaging `
+            --hidden-import PIL.Image `
+            --hidden-import PIL.ImageTk `
+            --noupx `
+            scpo_app.py
 
       - name: Verificar Chromium no dist
+        shell: pwsh
         run: |
-          python -c "
-          from pathlib import Path
-          dist = Path('dist/SCPO_LoginTest/_internal/playwright/driver/package/.local-browsers')
-          print('Chromium no dist:', dist.exists())
-          if dist.exists():
-              for item in dist.iterdir():
-                  print(' -', item.name)
-          "
+          $dist = "dist\SCPO_LoginTest\_internal\playwright\driver\package\.local-browsers"
+          Write-Host "Chromium no dist existe: $(Test-Path $dist)"
+          if (Test-Path $dist) {
+            Get-ChildItem $dist | ForEach-Object { Write-Host " - $($_.Name)" }
+          }
 
       - uses: actions/upload-artifact@v4
         with:

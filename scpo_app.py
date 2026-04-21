@@ -10,11 +10,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
-# ── Runtime hook Playwright — antes de qualquer import playwright ─────────────
-if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-    _cand = Path(sys._MEIPASS) / "playwright" / "driver" / "package" / ".local-browsers"
-    if _cand.exists():
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_cand)
+# ── Pasta permanente para o Chromium (sobrevive entre execuções) ──────────────
+# Fica em C:\Users\<usuario>\AppData\Local\SCPOBrowser\
+BROWSER_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SCPOBrowser"
+
+# ── Configura PLAYWRIGHT_BROWSERS_PATH para pasta permanente ─────────────────
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(BROWSER_DIR)
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -22,14 +23,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 URL_LOGIN = "https://scpo.mte.gov.br/"
 LOGIN_CPF = "038.144.411-25"
 
-# Seletores confirmados via DevTools
 SEL_CPF     = "#PlaceHolderConteudo_txtCPF"
 SEL_SENHA   = "#PlaceHolderConteudo_txtSenha"
 SEL_CAPTCHA = "#txtCaptcha"
 SEL_IMG_CAP = "img[src*='CaptchaImage']"
 SEL_BTN     = "#PlaceHolderConteudo_btnLogin"
 
-# ── Paleta Morais ─────────────────────────────────────────────────────────────
 COR_BG       = "#1e2a3a"
 COR_LOG      = "#131c26"
 COR_CAMPO    = "#2a3f55"
@@ -39,7 +38,6 @@ COR_TEXTO    = "#ffffff"
 COR_LABEL    = "#90adc4"
 COR_LOG_TEXT = "#7ec8a0"
 
-# ── Config persistente ────────────────────────────────────────────────────────
 CONFIG_PATH = Path(
     sys.executable if getattr(sys, "frozen", False) else __file__
 ).parent / "scpo_config.json"
@@ -53,14 +51,64 @@ def carregar_config() -> dict:
 def salvar_config(cfg: dict):
     CONFIG_PATH.write_text(json.dumps(cfg))
 
-# ── Automação — só login ──────────────────────────────────────────────────────
+# ── Instala Chromium se necessário ────────────────────────────────────────────
+def garantir_chromium(log_cb) -> bool:
+    """
+    Verifica se o Chromium já está instalado em BROWSER_DIR.
+    Se não, baixa automaticamente (~170MB, só na primeira vez).
+    Retorna True se OK, False se falhou.
+    """
+    import subprocess
+    
+    # Verifica se já existe alguma pasta chromium-* em BROWSER_DIR
+    BROWSER_DIR.mkdir(parents=True, exist_ok=True)
+    chromium_dirs = list(BROWSER_DIR.glob("chromium-*"))
+    
+    if chromium_dirs:
+        chrome_exe = chromium_dirs[0] / "chrome-win64" / "chrome.exe"
+        if chrome_exe.exists():
+            log_cb(f"Chromium encontrado: {chromium_dirs[0].name}")
+            return True
+    
+    # Precisa baixar
+    log_cb("Chromium nao encontrado. Baixando (~170MB)...")
+    log_cb("Isso so acontece na PRIMEIRA execucao. Aguarde...")
+    
+    try:
+        # Usa o playwright CLI para instalar
+        exe = sys.executable
+        result = subprocess.run(
+            [exe, "-m", "playwright", "install", "chromium"],
+            env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": str(BROWSER_DIR)},
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode == 0:
+            log_cb("Chromium instalado com sucesso!")
+            return True
+        else:
+            log_cb(f"Erro ao instalar Chromium: {result.stderr[:200]}")
+            return False
+    except Exception as e:
+        log_cb(f"Erro ao instalar Chromium: {e}")
+        return False
+
+# ── Automação ─────────────────────────────────────────────────────────────────
 def executar_login(senha: str, step_cb, log_cb, done_cb,
                    fn_mostrar_captcha, evento_captcha, dados_captcha):
     import traceback
     try:
+        # ── Garantir Chromium ─────────────────────────────────────────────────
+        log_cb("Verificando Chromium...")
+        step_cb(5, "Verificando navegador")
+        if not garantir_chromium(log_cb):
+            raise Exception(
+                "Nao foi possivel instalar o Chromium.\n"
+                "Verifique sua conexao com a internet e tente novamente.")
+
+        step_cb(15, "Iniciando Playwright")
         with sync_playwright() as p:
-            log_cb("Iniciando Chromium (Playwright)...")
-            step_cb(10, "Abrindo navegador")
+            log_cb("Iniciando Chromium...")
+            step_cb(20, "Abrindo navegador")
 
             browser = p.chromium.launch(
                 headless=False,
@@ -74,58 +122,59 @@ def executar_login(senha: str, step_cb, log_cb, done_cb,
 
             # ── Abrir site ────────────────────────────────────────────────────
             log_cb(f"Abrindo {URL_LOGIN}...")
-            step_cb(20, "Carregando site")
+            step_cb(30, "Carregando site")
             page.goto(URL_LOGIN, wait_until="networkidle", timeout=60_000)
-            log_cb("Pagina carregada.")
+            log_cb("Pagina carregada!")
 
-            # ── Preencher CPF e senha ─────────────────────────────────────────
-            step_cb(35, "Preenchendo login")
+            # ── Preencher login e senha ───────────────────────────────────────
+            step_cb(45, "Preenchendo login")
             page.fill(SEL_CPF, LOGIN_CPF)
             page.fill(SEL_SENHA, senha)
             log_cb("CPF e senha preenchidos.")
 
-            # ── Capturar imagem do captcha ────────────────────────────────────
-            step_cb(50, "Aguardando captcha")
+            # ── Capturar captcha ──────────────────────────────────────────────
+            step_cb(55, "Aguardando captcha")
             log_cb("Capturando imagem do captcha...")
+            img_bytes = b""
             try:
                 img_elem = page.locator(SEL_IMG_CAP).first
                 img_elem.wait_for(state="visible", timeout=10_000)
                 img_bytes = img_elem.screenshot()
                 log_cb(f"Captcha capturado ({len(img_bytes)} bytes).")
             except Exception as ex:
-                log_cb(f"Captcha nao encontrado ({ex}) — tente digitar no navegador.")
-                img_bytes = b""
+                log_cb(f"Captcha nao capturado: {ex}")
+                log_cb("Digite o codigo visivel no navegador.")
 
-            # Envia imagem para UI exibir popup
+            # Mostra popup com imagem
             dados_captcha["img_bytes"] = img_bytes
-            fn_mostrar_captcha()          # dispara popup na thread da UI
-            evento_captcha.wait()         # aguarda usuário confirmar
+            fn_mostrar_captcha()
+            evento_captcha.wait()
             codigo = dados_captcha.get("valor", "")
-            log_cb(f"Codigo recebido: {codigo}")
+            log_cb(f"Codigo: {codigo}")
 
-            # ── Preencher captcha e clicar Entrar ─────────────────────────────
+            # ── Preencher captcha e entrar ────────────────────────────────────
             step_cb(70, "Efetuando login")
             if codigo:
                 page.fill(SEL_CAPTCHA, codigo)
 
-            log_cb("Clicando em Entrar...")
+            log_cb("Clicando Entrar...")
             try:
                 page.click(SEL_BTN, timeout=5_000)
             except PWTimeout:
-                page.evaluate("__doPostBack('ctl00$PlaceHolderConteudo$btnLogin','')")
+                page.evaluate(
+                    "document.getElementById('PlaceHolderConteudo_btnLogin').click()")
 
             page.wait_for_load_state("networkidle", timeout=30_000)
-            url_atual = page.url
-            log_cb(f"URL apos login: {url_atual}")
+            url = page.url
+            log_cb(f"URL apos login: {url}")
 
             # ── Verificar resultado ───────────────────────────────────────────
-            step_cb(100, "Concluido")
-            if "Default.aspx" in url_atual and page.locator(SEL_CPF).count() > 0:
-                raise Exception("Login falhou — verifique senha e captcha.")
+            step_cb(100, "Concluido!")
+            if page.locator(SEL_CPF).count() > 0:
+                raise Exception("Login falhou — senha ou captcha incorreto.")
 
-            log_cb("Login realizado com sucesso!")
-            done_cb(True, "Login OK!\nNavegador aberto — proxima etapa: navegacao.")
-            # Navegador permanece aberto
+            log_cb("LOGIN REALIZADO COM SUCESSO!")
+            done_cb(True, "Login OK!\nNavegador aberto.")
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -158,42 +207,38 @@ class AppSCPO(tk.Tk):
         frame = tk.Frame(self, bg=COR_BG, padx=PAD)
         frame.pack(fill="x")
 
-        # CPF (só leitura)
         tk.Label(frame, text="Login (CPF):", bg=COR_BG, fg=COR_LABEL,
                  font=("Consolas", 10), anchor="w"
                  ).grid(row=0, column=0, sticky="w", pady=6, padx=(0, 8))
         tk.Label(frame, text=LOGIN_CPF, bg=COR_BG, fg=COR_LOG_TEXT,
                  font=("Consolas", 10)).grid(row=0, column=1, sticky="w")
 
-        # Senha
         tk.Label(frame, text="Senha SCPO:", bg=COR_BG, fg=COR_LABEL,
                  font=("Consolas", 10), anchor="w"
                  ).grid(row=1, column=0, sticky="w", pady=6, padx=(0, 8))
-        frame_s = tk.Frame(frame, bg=COR_BG)
-        frame_s.grid(row=1, column=1, sticky="w")
-        self.ent_senha = tk.Entry(frame_s, textvariable=self.var_senha,
+        fs = tk.Frame(frame, bg=COR_BG)
+        fs.grid(row=1, column=1, sticky="w")
+        self.ent_senha = tk.Entry(fs, textvariable=self.var_senha,
                                    bg=COR_CAMPO, fg=COR_TEXTO, show="*",
                                    insertbackground=COR_TEXTO,
                                    font=("Consolas", 11), relief="flat", width=20)
         self.ent_senha.pack(side="left")
-        tk.Button(frame_s, text="Mostrar", bg=COR_CAMPO, fg=COR_LABEL,
+        tk.Button(fs, text="Mostrar", bg=COR_CAMPO, fg=COR_LABEL,
                   font=("Consolas", 8), relief="flat", cursor="hand2",
                   command=self._toggle_senha).pack(side="left", padx=4)
 
-        # Barra de progresso
         self._var_prog = tk.DoubleVar(value=0)
         self._var_desc = tk.StringVar(value="Aguardando...")
         tk.Label(self, textvariable=self._var_desc, bg=COR_BG, fg=COR_LABEL,
                  font=("Consolas", 9)).pack(pady=(PAD, 2))
         self._barra = ttk.Progressbar(self, variable=self._var_prog,
-                                       maximum=100, length=400,
+                                       maximum=100, length=420,
                                        style="v.Horizontal.TProgressbar")
         self._barra.pack(padx=PAD, pady=(0, 6))
         s = ttk.Style(); s.theme_use("default")
         s.configure("v.Horizontal.TProgressbar",
                      troughcolor=COR_LOG, background=COR_BARRA)
 
-        # Botão
         self._btn_run = tk.Button(self, text="▶  Iniciar Login",
                                    bg=COR_BOTAO, fg=COR_TEXTO,
                                    font=("Consolas", 11, "bold"),
@@ -201,7 +246,6 @@ class AppSCPO(tk.Tk):
                                    padx=20, pady=8, command=self._iniciar)
         self._btn_run.pack(pady=6)
 
-        # Log
         tk.Label(self, text="Log:", bg=COR_BG, fg=COR_LABEL,
                  font=("Consolas", 9), anchor="w").pack(fill="x", padx=PAD)
         self._txt_log = tk.Text(self, bg=COR_LOG, fg=COR_LOG_TEXT,
@@ -209,7 +253,6 @@ class AppSCPO(tk.Tk):
                                  relief="flat", state="disabled")
         self._txt_log.pack(fill="x", padx=PAD, pady=(0, PAD))
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
     def _toggle_senha(self):
         self.ent_senha.config(
             show="" if self.ent_senha.cget("show") == "*" else "*")
@@ -236,12 +279,10 @@ class AppSCPO(tk.Tk):
         (messagebox.showinfo if ok else messagebox.showerror)("Resultado", msg)
 
     def _mostrar_captcha(self):
-        """Chamado via after() — abre popup com imagem do captcha."""
         self.after(0, self._abrir_popup_captcha)
 
     def _abrir_popup_captcha(self):
         img_bytes = self._dados_captcha.get("img_bytes", b"")
-
         win = tk.Toplevel(self)
         win.title("Codigo de Seguranca")
         win.configure(bg=COR_BG)
@@ -258,18 +299,14 @@ class AppSCPO(tk.Tk):
                 lbl.image = photo
                 lbl.pack(padx=16, pady=(16, 4))
             except Exception:
-                tk.Label(win, text="[imagem nao disponivel]",
-                         bg=COR_BG, fg=COR_LABEL,
-                         font=("Consolas", 9)).pack(pady=8)
+                pass
         else:
-            tk.Label(win,
-                     text="Captcha nao capturado.\nDigite o codigo visivel no navegador.",
+            tk.Label(win, text="Digite o codigo visivel no navegador.",
                      bg=COR_BG, fg=COR_LABEL,
-                     font=("Consolas", 9), justify="center").pack(pady=12)
+                     font=("Consolas", 9)).pack(pady=12)
 
         tk.Label(win, text="Digite o codigo:", bg=COR_BG, fg=COR_LABEL,
                  font=("Consolas", 10)).pack()
-
         var = tk.StringVar()
         ent = tk.Entry(win, textvariable=var, bg=COR_CAMPO, fg=COR_TEXTO,
                        font=("Consolas", 14, "bold"), justify="center",
@@ -288,7 +325,6 @@ class AppSCPO(tk.Tk):
                   command=confirmar).pack(pady=(0, 16))
         ent.bind("<Return>", confirmar)
 
-    # ── Iniciar ───────────────────────────────────────────────────────────────
     def _iniciar(self):
         if not self.var_senha.get().strip():
             messagebox.showwarning("Aviso", "Informe a senha.")
@@ -296,7 +332,6 @@ class AppSCPO(tk.Tk):
         salvar_config({"senha": self.var_senha.get().strip()})
         self._evento_captcha.clear()
         self._dados_captcha.clear()
-
         self._btn_run.config(state="disabled")
         self._var_prog.set(0)
         self._var_desc.set("Iniciando...")
@@ -306,13 +341,11 @@ class AppSCPO(tk.Tk):
 
         threading.Thread(
             target=executar_login,
-            args=(
-                self.var_senha.get().strip(),
-                self._step, self._log, self._done,
-                self._mostrar_captcha,
-                self._evento_captcha,
-                self._dados_captcha,
-            ),
+            args=(self.var_senha.get().strip(),
+                  self._step, self._log, self._done,
+                  self._mostrar_captcha,
+                  self._evento_captcha,
+                  self._dados_captcha),
             daemon=True
         ).start()
 

@@ -1,4 +1,4 @@
-name: Gerar EXE - SCPO Login Test
+name: Build SCPO Login Test
 
 on:
   push:
@@ -17,21 +17,36 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install selenium pyinstaller
+        run: pip install playwright pillow pyinstaller
 
-      - name: Gerar EXE
+      - name: Cache Chromium
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.pythonLocation }}\Lib\site-packages\playwright\driver\package\.local-browsers
+          key: pw-chromium-${{ runner.os }}-${{ hashFiles('**/requirements*.txt') }}
+
+      - name: Instalar Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: python -m playwright install chromium
+
+      - name: Build EXE
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
         run: >
-          python -m PyInstaller --onefile --windowed
+          python -m PyInstaller --onedir --windowed
           --name "SCPO_LoginTest"
-          --collect-all selenium
-          --hidden-import selenium.webdriver.edge.options
-          --hidden-import selenium.webdriver.edge.service
-          --hidden-import selenium.webdriver.support.ui
-          --hidden-import selenium.webdriver.support.expected_conditions
+          --collect-all playwright
+          --hidden-import PIL._imaging
+          --hidden-import PIL.Image
+          --hidden-import PIL.ImageTk
+          --noupx
           scpo_app.py
 
       - uses: actions/upload-artifact@v4
         with:
           name: SCPO_LoginTest-Windows
-          path: dist/SCPO_LoginTest.exe
+          path: dist/SCPO_LoginTest/
           retention-days: 30
